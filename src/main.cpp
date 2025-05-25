@@ -1,94 +1,117 @@
-//Prueba todos los sensores conectados al dispositivo
-//Incluye una pequeña logica que activa/desactiva el relay1 segun la humedad que lee el sensor de humedad1
-
-
 #include <Arduino.h>
 #include <Wire.h> 
 #define HELTEC_WIRELESS_STICK
-#include <heltec_unofficial.h>
 
-//  se definene los pines de los sensores
-int soilSensor1_pin = 1; //cable amarillo
-int soilSensor2_pin = 2; //cable azul
-int relay1_pin = 3;      //cable verde
-int flowSensor1_pin = 4; //cable purpura
+// Definición de pines para los sensores
+const int SENSOR1_PIN = 1;    // GPIO1
+const int SENSOR2_PIN = 2;    // GPIO2
+const int RELAY_PIN = 3;      // GPIO3 para el relé
+const int FLOW_PIN = 4;       // GPIO4 para el sensor de flujo
 
-// variables sensor humedad-sustrato 1
-const int valorSeco = 2300;
-const int valorHumedo = 1070;
+// Variables para almacenar los valores
+int sensor1Value = 0;
+int sensor2Value = 0;
+int sensor1Percent = 0;
+int sensor2Percent = 0;
 
-//variables sensor humedad-sustrato 2
-const int valorSeco2 = 2300;
-const int valorHumedo2 = 1070;
+// Variables para el sensor de flujo
+volatile long pulseCount = 0;
+float flowRate = 0.0;
+unsigned long oldTime = 0;
+const float FLOW_CALIBRATION = 7.5;  // Factor de calibración del YF-S201
 
-//  varialves para sensor de flujo        
-float factor_conversion = 7.5; // Factor de conversión de frecuencia a caudal (se puede modificar para calibrar)
+// Rangos de los sensores
+const int SENSOR1_DRY = 2500;    // Valor cuando está seco
+const int SENSOR1_WET = 1125;    // Valor cuando está mojado
+const int SENSOR2_DRY = 3360;    // Valor cuando está seco
+const int SENSOR2_WET = 1225;    // Valor cuando está mojado
 
-//  Funcion para obtener frecuencia de los pulsos
-float LeerFlujo() {
-  unsigned long duracion = pulseIn(flowSensor1_pin, HIGH, 1000000); // Espera un pulso hasta 1s
-  if (duracion == 0) return 0; // Si no hay señal, retorna 0 Hz
+// Umbral de humedad para activar el relé
+const int HUMIDITY_THRESHOLD = 50;
 
-  float frecuencia = 1000000.0 / (duracion * 2); // Calcula frecuencia en Hz
-  return frecuencia;
+// Función de interrupción para contar pulsos
+void IRAM_ATTR pulseCounter() {
+  pulseCount++;
 }
+
 void setup() {
-  heltec_setup();
+  // Inicializar comunicación serial
   Serial.begin(9600);
-  Serial.print("inicio Setup()\n");
-  pinMode(soilSensor1_pin, INPUT);
-  pinMode(soilSensor2_pin, INPUT);
-  pinMode(relay1_pin, OUTPUT);
-  pinMode(flowSensor1_pin, INPUT_PULLUP); //pin como entrada con resistencia pull-up
+  Serial.println("Iniciando lectura de sensores...");
+  Serial.println("Sensor sustrato1          Sensor sustrato2          Caudal");
+  Serial.println("--------------------------------------------------------");
   
-
+  // Configurar pines como entradas con pull-down
+  pinMode(SENSOR1_PIN, INPUT_PULLDOWN);
+  pinMode(SENSOR2_PIN, INPUT_PULLDOWN);
+  
+  // Configurar pin del relé como salida
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);  // Iniciar con el relé apagado
+  
+  // Configurar pin del sensor de flujo
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
 }
+
 void loop() {
-  heltec_loop();
-  display.clear();
-  // Leer flujo SIN interrupciones
-  float frecuencia = LeerFlujo();
-  float caudal_L_m = frecuencia / factor_conversion;
-  float caudal_L_h = caudal_L_m * 60;
+  // Leer valores de los sensores
+  sensor1Value = analogRead(SENSOR1_PIN);
+  sensor2Value = analogRead(SENSOR2_PIN);
   
-  //lee sensor humedad-sustrato 1
-  int humedadRaw = analogRead(soilSensor1_pin);
-  int humedadPorcentaje = map(humedadRaw, valorSeco, valorHumedo, 0, 100);
-  humedadPorcentaje = constrain(humedadPorcentaje, 0, 100);
-    // Control del relé según la humedad sensor humedad-sustrato 1
-  if (humedadPorcentaje < 50) {
-    digitalWrite(relay1_pin, HIGH); // Activa el relay1
-    Serial.println("relay1 - HIGH (activado por humedad baja)");
+  // Calcular porcentajes usando los rangos específicos
+  sensor1Percent = map(sensor1Value, SENSOR1_DRY, SENSOR1_WET, 0, 100);
+  sensor2Percent = map(sensor2Value, SENSOR2_DRY, SENSOR2_WET, 0, 100);
+  
+  // Asegurar que los porcentajes estén dentro del rango 0-100
+  sensor1Percent = constrain(sensor1Percent, 0, 100);
+  sensor2Percent = constrain(sensor2Percent, 0, 100);
+  
+  // Control del relé basado en el promedio de humedad
+  int averageHumidity = (sensor1Percent + sensor2Percent) / 2;
+  if (averageHumidity <= HUMIDITY_THRESHOLD) {
+    digitalWrite(RELAY_PIN, HIGH);  // Activar relé cuando está seco
   } else {
-    digitalWrite(relay1_pin, LOW); // Desactiva el relay1
-    Serial.println("relay1 - LOW (humedad suficiente)");
+    digitalWrite(RELAY_PIN, LOW);   // Desactivar relé cuando está húmedo
   }
   
-  // Imprime
-  display.print("SEN-1: ");           //imprime por display dispositivo 
-  display.println(humedadPorcentaje); //imprime por display dispositivo 
+  // Calcular caudal cada segundo
+  if ((millis() - oldTime) >= 1000) {
+    // Desactivar interrupciones mientras calculamos
+    detachInterrupt(digitalPinToInterrupt(FLOW_PIN));
+    
+    // Calcular caudal en L/min
+    flowRate = (pulseCount * 60.0) / FLOW_CALIBRATION;
+    
+    // Reiniciar contador
+    pulseCount = 0;
+    
+    // Reactivar interrupciones
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
+    
+    // Actualizar tiempo
+    oldTime = millis();
+  }
   
-  Serial.print("Sensor sustrato1: ");
-  Serial.print(humedadPorcentaje); Serial.print("% - ");
-  Serial.print(humedadRaw); Serial.println(" valor raw");
-  //lee sensor humedad-sustrato 2
-  humedadRaw = analogRead(soilSensor2_pin);
-  humedadPorcentaje = map(humedadRaw, valorSeco2, valorHumedo2, 0, 100);
-  humedadPorcentaje = constrain(humedadPorcentaje, 0, 100);
+  // Imprimir resultados en columnas
+  if (sensor1Value < 1000) {
+    Serial.print(" ");
+  }
+  Serial.print(sensor1Value);
+  Serial.print(" (");
+  Serial.print(sensor1Percent);
+  Serial.print("%)        ");
+  if (sensor2Value < 1000) {
+    Serial.print(" ");
+  }
+  Serial.print(sensor2Value);
+  Serial.print(" (");
+  Serial.print(sensor2Percent);
+  Serial.print("%)    ");
+  Serial.print(flowRate, 2);  // Mostrar caudal con 2 decimales
+  Serial.print(" L/min    Relé: ");
+  Serial.println(averageHumidity <= HUMIDITY_THRESHOLD ? "ON" : "OFF");
   
-  display.print("SEN-2: ");           //imprime por display dispositivo 
-  display.println(humedadPorcentaje); //imprime por display dispositivo 
-  Serial.print("Sensor sustrato2: ");
-  
-  Serial.print(humedadPorcentaje); Serial.print("% - ");
-  Serial.print(humedadRaw); Serial.println(" valor raw");
-
-  Serial.print("FrecuenciaPulsos: ");
-  Serial.print(frecuencia, 0);
-  Serial.print(" Hz\tCaudal: ");
-  Serial.print(caudal_L_m, 3);
-  Serial.print(" L/m\t");
-  Serial.print(caudal_L_h, 3);
-  Serial.println(" L/h");
-  delay(1000);
-}
+  // Esperar 1 segundo antes de la siguiente lectura
+  delay(500);
+} 
